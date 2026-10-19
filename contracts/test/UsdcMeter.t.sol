@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import {Test, console2} from "forge-std/Test.sol";
 import {UsdcMeter} from "../UsdcMeter.sol";
 import {MaliciousProvider} from "../test-helpers/MaliciousProvider.sol";
+import {ReentrantDepositor, LoggingProvider} from "../test-helpers/PayoutHooks.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 // ============================================================
 //  UsdcMeter — Foundry unit / fuzz / invariant test suite
@@ -163,20 +165,91 @@ contract UsdcMeterTest is Test {
     // -------------------------------------------------------
 
     /// Test 5: deposit does NOT cancel a pending withdrawal for that channel.
-    function test_Deposit_DoesNotCancelPendingWithdraw() public {
+    /// v2: deposits are refused while a withdrawal is pending AND after it matured (until cancel/complete).
+    function test_Deposit_RevertsWhileWithdrawPending() public {
         _deposit(alice, bob, 1 ether);
 
         vm.prank(alice);
         meter.requestWithdraw(bob);
-
         (,,,uint64 readyAtBefore,) = meter.getChannel(alice, bob);
         assertGt(readyAtBefore, 0, "withdraw should be pending");
 
-        // Another deposit from alice to bob
-        _deposit(alice, bob, 0.5 ether);
+        vm.prank(alice);
+        vm.expectRevert(UsdcMeter.WithdrawAlreadyPending.selector);
+        meter.deposit{value: 0.5 ether}(bob);
 
-        (,,,uint64 readyAtAfter,) = meter.getChannel(alice, bob);
-        assertEq(readyAtAfter, readyAtBefore, "pending withdrawal must not be cleared by deposit");
+        vm.warp(block.timestamp + 30 days); // matured
+        vm.prank(alice);
+        vm.expectRevert(UsdcMeter.WithdrawAlreadyPending.selector);
+        meter.deposit{value: 0.5 ether}(bob);
+
+        (,,,uint64 readyAtAfter, uint256 avail) = meter.getChannel(alice, bob);
+        assertEq(readyAtAfter, readyAtBefore, "pending withdrawal untouched");
+        assertEq(avail, 1 ether);
+
+        vm.prank(alice);
+        meter.cancelWithdraw(bob);
+        _deposit(alice, bob, 0.5 ether); // allowed again after cancel
+        (,,,, avail) = meter.getChannel(alice, bob);
+        assertEq(avail, 1.5 ether);
+    }
+
+    /// v2: deposit() is nonReentrant - a provider that re-deposits its payout from receive() fails its own redeem.
+    function test_Reentrancy_DepositDuringRedeem_Reverts() public {
+        ReentrantDepositor prov = new ReentrantDepositor(address(meter), carol);
+        _deposit(alice, address(prov), 1 ether);
+        bytes memory sig = _sign(alicePk, alice, address(prov), 0.4 ether);
+        vm.expectRevert(UsdcMeter.TransferFailed.selector);
+        meter.redeem(alice, address(prov), 0.4 ether, sig);
+        (,, uint128 red,, uint256 avail) = meter.getChannel(alice, address(prov));
+        assertEq(red, 0);
+        assertEq(avail, 1 ether);
+    }
+
+    /// v2: Redeemed and Withdrawn are emitted before the native transfer (checks-effects-interactions).
+    function test_Events_EmittedBeforePayout() public {
+        LoggingProvider prov = new LoggingProvider();
+        _deposit(alice, address(prov), 1 ether);
+        bytes memory sig = _sign(alicePk, alice, address(prov), 0.4 ether);
+        vm.recordLogs();
+        meter.redeem(alice, address(prov), 0.4 ether, sig);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        assertEq(logs[0].topics[0], UsdcMeter.Redeemed.selector);
+        assertEq(logs[1].topics[0], LoggingProvider.Received.selector);
+    }
+
+    /// v2 (review F1): a request armed with dust and left to mature can no longer sweep a later deposit.
+    function test_ArmedWithdrawal_CannotSweepLaterDeposit() public {
+        _deposit(alice, bob, 1);
+        vm.prank(alice);
+        meter.requestWithdraw(bob);
+        vm.warp(block.timestamp + 30 days);
+
+        vm.prank(alice);
+        vm.expectRevert(UsdcMeter.WithdrawAlreadyPending.selector);
+        meter.deposit{value: 10 ether}(bob);
+
+        vm.prank(alice);
+        meter.cancelWithdraw(bob);
+        _deposit(alice, bob, 10 ether);
+        vm.prank(alice);
+        meter.requestWithdraw(bob);
+
+        vm.prank(alice);
+        vm.expectRevert(UsdcMeter.TooEarlyToWithdraw.selector);
+        meter.completeWithdraw(bob);
+
+        uint256 bobStart = bob.balance;
+        bytes memory sig = _sign(alicePk, alice, bob, 4 ether);
+        meter.redeem(alice, bob, 4 ether, sig);
+        assertEq(bob.balance - bobStart, 4 ether, "provider paid for the calls it served");
+
+        vm.warp(block.timestamp + NOTICE);
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        meter.completeWithdraw(bob);
+        assertEq(alice.balance - before, 6 ether + 1, "client gets exactly the rest");
     }
 
     // -------------------------------------------------------

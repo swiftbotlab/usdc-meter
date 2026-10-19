@@ -5,9 +5,15 @@ import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title UsdcMeter
+/// @title UsdcMeter (v2)
 /// @notice Prepaid, one-way metered billing payment channels using native value deposits and EIP-712 vouchers.
 /// @dev One channel exists per `(client, provider)` pair, keyed by `keccak256(abi.encode(client, provider))`.
+///      Provider rules: stop serving and redeem the latest voucher as soon as `withdrawReadyAt != 0` (pending OR
+///      matured; a matured request stays executable until it is completed or cancelled). Deposits are refused while a
+///      withdrawal is pending, so the amount that can leave is never larger than what was under notice.
+///      Vouchers are lifetime-cumulative per `(client, provider)`: an unredeemed voucher stays redeemable against later
+///      deposits. Only EOA ECDSA signatures are accepted (65 bytes, v 27/28, low s; no ERC-1271).
+///      USDC sent other than through `deposit()` credits no channel and cannot be recovered.
 contract UsdcMeter is EIP712, ReentrancyGuard {
     /// @notice Channel accounting state for a `(client, provider)` pair.
     /// @param deposited Total amount ever deposited by the client.
@@ -123,8 +129,10 @@ contract UsdcMeter is EIP712, ReentrancyGuard {
     }
 
     /// @notice Deposits native value into the caller's channel for `provider`.
+    /// @dev Reverts with `WithdrawAlreadyPending` while a withdrawal request exists (pending or matured): cancel it
+    ///      first; a new request then restarts the full notice period.
     /// @param provider Service provider receiving future redemptions.
-    function deposit(address provider) external payable {
+    function deposit(address provider) external payable nonReentrant {
         if (msg.value == 0) {
             revert ZeroValue();
         }
@@ -137,6 +145,9 @@ contract UsdcMeter is EIP712, ReentrancyGuard {
 
         bytes32 key = _channelKey(msg.sender, provider);
         Channel storage ch = _channels[key];
+        if (ch.withdrawReadyAt != 0) {
+            revert WithdrawAlreadyPending();
+        }
 
         uint256 nextDeposited = uint256(ch.deposited) + msg.value;
         if (nextDeposited > type(uint128).max) {
@@ -168,16 +179,17 @@ contract UsdcMeter is EIP712, ReentrancyGuard {
         (uint256 paid, uint256 newRedeemed) = _computePayment(ch, cumulativeAmount);
 
         ch.redeemed = uint128(newRedeemed);
+        emit Redeemed(client, provider, cumulativeAmount, paid, newRedeemed);
 
         (bool ok,) = provider.call{value: paid}("");
         if (!ok) {
             revert TransferFailed();
         }
-
-        emit Redeemed(client, provider, cumulativeAmount, paid, newRedeemed);
     }
 
     /// @notice Starts the notice period to withdraw currently available channel balance.
+    /// @dev While the request exists the provider can still redeem; deposits are refused until it is cancelled or
+    ///      completed.
     /// @param provider Channel provider.
     function requestWithdraw(address provider) external {
         bytes32 key = _channelKey(msg.sender, provider);
@@ -233,6 +245,7 @@ contract UsdcMeter is EIP712, ReentrancyGuard {
         }
         ch.withdrawn = uint128(nextWithdrawn);
         ch.withdrawReadyAt = 0;
+        emit Withdrawn(msg.sender, provider, available);
 
         if (available > 0) {
             (bool ok,) = msg.sender.call{value: available}("");
@@ -240,8 +253,6 @@ contract UsdcMeter is EIP712, ReentrancyGuard {
                 revert TransferFailed();
             }
         }
-
-        emit Withdrawn(msg.sender, provider, available);
     }
 
     /// @notice Returns the full channel state and currently available balance.

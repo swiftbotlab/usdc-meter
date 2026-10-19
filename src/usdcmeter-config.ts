@@ -1,8 +1,10 @@
 /**
  * UsdcMeter contract config — one entry per chain.
  *
- * VITE_ARC_NETWORK=testnet (default) | mainnet
- * Arc mainnet chain and contract address are stubbed until deployment.
+ * Network selection (first match wins):
+ *   1. ?network=testnet|mainnet in the page URL (lets one hosted build show both)
+ *   2. VITE_ARC_NETWORK=testnet|mainnet at build time
+ *   3. DEFAULT_NETWORK below  <- the one-line switch
  */
 import { arcTestnet, mainnet } from 'viem/chains'
 import { defineChain } from 'viem'
@@ -25,11 +27,31 @@ export const arcMainnet = defineChain({
 export type SupportedArcChain = typeof arcTestnet | typeof arcMainnet
 
 // ---------------------------------------------------------------------------
-// ACTIVE chain — chosen at build time by VITE_ARC_NETWORK
+// ACTIVE chain
 // ---------------------------------------------------------------------------
-const _network = String(import.meta.env.VITE_ARC_NETWORK ?? 'testnet').trim().toLowerCase()
-export const ACTIVE_CHAIN: SupportedArcChain =
-  _network === 'mainnet' ? arcMainnet : arcTestnet
+export type ArcNetwork = 'testnet' | 'mainnet'
+
+/** ONE-LINE SWITCH: the network this build serves when the URL / build env do not choose one. */
+export const DEFAULT_NETWORK: ArcNetwork = 'testnet'
+
+function _pick(v: unknown): ArcNetwork | undefined {
+  const s = String(v ?? '').trim().toLowerCase()
+  return s === 'testnet' || s === 'mainnet' ? s : undefined
+}
+const _fromUrl = (() => {
+  try { return _pick(new URLSearchParams(window.location.search).get('network')) } catch { return undefined }
+})()
+export const ACTIVE_NETWORK: ArcNetwork = _fromUrl ?? _pick(import.meta.env.VITE_ARC_NETWORK) ?? DEFAULT_NETWORK
+export const ACTIVE_CHAIN: SupportedArcChain = ACTIVE_NETWORK === 'mainnet' ? arcMainnet : arcTestnet
+
+/** Same page on the other network (keeps the path, swaps ?network=). */
+export function networkHref(n: ArcNetwork): string {
+  try {
+    const u = new URL(window.location.href)
+    u.searchParams.set('network', n)
+    return u.pathname + u.search + u.hash
+  } catch { return `?network=${n}` }
+}
 
 /** All chains needed in the wagmi config (active Arc chain + mainnet for ENS). */
 export const WAGMI_CHAINS = [ACTIVE_CHAIN, mainnet] as const
@@ -45,11 +67,12 @@ export interface MeterChainConfig {
 }
 
 export const METER_CHAINS: Partial<Record<number, MeterChainConfig>> = {
+  // UsdcMeter v2 on Arc Testnet (noticePeriod 120 s). v1 was 0xeca961579bcf4978d083a0c3a72788a2def6e61a.
   [arcTestnet.id]: {
-    address: '0xeca961579bcf4978d083a0c3a72788a2def6e61a',
-    deployBlock: 67920821n,
+    address: '0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84',
+    deployBlock: 67934662n,
   },
-  // Arc mainnet — add address + deployBlock once deployed:
+  // UsdcMeter v2 on Arc mainnet — fill in after mainnet/deploy.py (one line):
   // [arcMainnet.id]: { address: '0x...', deployBlock: 0n },
 }
 

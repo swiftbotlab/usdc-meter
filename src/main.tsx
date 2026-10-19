@@ -10,8 +10,14 @@
  *  https://studio.arc.io
  */
 
-import './tracing'
-import './console-capture'
+import { IN_STUDIO_PREVIEW, FRAMED_ELSEWHERE } from './studio-preview'
+import { ACTIVE_CHAIN } from './usdcmeter-config'
+
+// Studio's trace + console panels: loaded ONLY inside the Studio preview (never on the public site).
+if (IN_STUDIO_PREVIEW) {
+  void import('./console-capture')
+  void import('./tracing').then((t) => t.registerChain(ACTIVE_CHAIN.id, ACTIVE_CHAIN.rpcUrls.default.http[0]))
+}
 
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -66,7 +72,16 @@ const StudioWatermark = () => (
   </a>
 )
 
+// Clickjacking guard: if another site frames this page, show a link out instead of a wallet UI.
+const FramedNotice = () => (
+  <div style={{ padding: 24, fontFamily: 'system-ui, sans-serif', color: '#e8eef8', background: '#0d1b2f', minHeight: '100vh' }}>
+    <p>USDC Meter only runs in its own tab.</p>
+    <a href={window.location.href} target="_top" rel="noopener noreferrer" style={{ color: '#acc6e9' }}>Open USDC Meter</a>
+  </div>
+)
+
 createRoot(document.getElementById('root')!).render(
+  FRAMED_ELSEWHERE ? <FramedNotice /> : (
   <StrictMode>
     <WagmiProvider config={config}>
       <QueryClientProvider client={queryClient}>
@@ -77,6 +92,7 @@ createRoot(document.getElementById('root')!).render(
         </ConnectKitProvider>
       </QueryClientProvider>
     </WagmiProvider>
-  </StrictMode>,
+  </StrictMode>
+  ),
 )
 

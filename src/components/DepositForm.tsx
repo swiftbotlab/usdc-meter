@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { useWriteContract, useWaitForTransactionReceipt, useAccount, useSwitchChain } from 'wagmi'
+import { useWriteContract, useWaitForTransactionReceipt, useAccount, useSwitchChain, useReadContract, useBytecode } from 'wagmi'
 import { useQueryClient } from '@tanstack/react-query'
 import { parseEther } from 'viem'
 import { toast } from 'sonner'
@@ -20,6 +20,7 @@ function parseOnchainError(err: unknown): string {
   if (msg.includes('zerovalue')) return 'Amount must be greater than 0.'
   if (msg.includes('selfchannel')) return 'Cannot open a channel with yourself.'
   if (msg.includes('amounttoolarge')) return 'Amount too large for this channel.'
+  if (msg.includes('withdrawalreadypending')) return 'A withdrawal is pending: cancel it before adding funds.'
   if (msg.includes('reverted')) return 'Transaction reverted.'
   return 'Something went wrong. Try again.'
 }
@@ -58,9 +59,25 @@ export function DepositForm({ provider, onDeposited }: Props) {
 
   const wrongChain = chainId !== ACTIVE_CHAIN.id
 
+  // v2 rule: no deposits while a withdrawal is pending or matured
+  const { data: channelData } = useReadContract({
+    address: cfg?.address,
+    abi: METER_ABI,
+    functionName: 'getChannel',
+    args: address && provider ? [address, provider] : undefined,
+    chainId: ACTIVE_CHAIN.id,
+    query: { enabled: !!address && !!provider && !!cfg && !wrongChain, refetchInterval: 5000 },
+  })
+  const withdrawPending = !!channelData && Number(channelData[3]) !== 0
+
+  // Vouchers must be plain ECDSA signatures from an EOA (no ERC-1271). A smart-contract wallet can deposit but its
+  // vouchers would never redeem. EIP-7702 delegated EOAs (code 0xef0100…) still sign with their own key and work.
+  const { data: code } = useBytecode({ address, chainId: ACTIVE_CHAIN.id, query: { enabled: !!address && !wrongChain } })
+  const isSmartAccount = !!code && code !== '0x' && !code.toLowerCase().startsWith('0xef0100')
+
   const handleDeposit = () => {
     if (wrongChain) { switchChain({ chainId: ACTIVE_CHAIN.id }); return }
-    if (!provider || !cfg || !amount) return
+    if (!provider || !cfg || !amount || withdrawPending || isSmartAccount) return
     let parsed: bigint
     try { parsed = parseEther(amount) } catch { toast.error('Invalid amount'); return }
     if (parsed === 0n) { toast.error('Amount must be > 0'); return }
@@ -88,7 +105,7 @@ export function DepositForm({ provider, onDeposited }: Props) {
     border: '1px solid var(--border)',
   }
 
-  const canDeposit = !!address && !!provider && !!amount && !wrongChain
+  const canDeposit = !!address && !!provider && !!amount && !wrongChain && !withdrawPending && !isSmartAccount
 
   if (!cfg) {
     return (
@@ -118,7 +135,9 @@ export function DepositForm({ provider, onDeposited }: Props) {
           style={{ color: 'var(--ink)' }}
         />
         <div className="mt-1.5 flex items-center justify-between">
-          <span className="text-xs" style={{ color: 'var(--subtle)' }}>USDC (native, 18 dec)</span>
+          <span className="text-xs" style={{ color: 'var(--subtle)' }} title="USDC sent to the contract any other way credits no channel and cannot be recovered">
+            USDC (native, 18 dec) · only via this form
+          </span>
           <div className="flex gap-1.5">
             {['0.1', '1', '10'].map((v) => (
               <button
@@ -133,6 +152,18 @@ export function DepositForm({ provider, onDeposited }: Props) {
           </div>
         </div>
       </div>
+
+      {withdrawPending && (
+        <p className="mb-2 text-xs" style={{ color: '#c9a020' }}>
+          A withdrawal is pending on this channel. Cancel it below to add funds (a new request restarts the notice).
+        </p>
+      )}
+      {isSmartAccount && (
+        <p className="mb-2 text-xs" style={{ color: 'var(--danger)' }}>
+          This wallet is a smart-contract account. USDC Meter vouchers must be signed by a regular (EOA) wallet, so a
+          provider could never redeem them. Connect an EOA to deposit.
+        </p>
+      )}
 
       <TxButton
         onClick={handleDeposit}

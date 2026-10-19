@@ -1,7 +1,7 @@
 import { ConnectKitButton } from 'connectkit'
 import { useAccount } from 'wagmi'
 import { Zap } from 'lucide-react'
-import { ACTIVE_CHAIN } from '../usdcmeter-config'
+import { ACTIVE_CHAIN, ACTIVE_NETWORK, networkHref, type ArcNetwork } from '../usdcmeter-config'
 
 export function Header() {
   const { chainId } = useAccount()
@@ -54,6 +54,20 @@ export function Header() {
               {ACTIVE_CHAIN.name}
             </span>
           )}
+          {/* Network switch: same app, ?network=testnet|mainnet */}
+          <nav className="flex rounded-full p-0.5 text-[11px] font-semibold" style={{ background: 'var(--surface-muted)' }} aria-label="Network">
+            {(['testnet', 'mainnet'] as ArcNetwork[]).map((n) => (
+              <a
+                key={n}
+                href={networkHref(n)}
+                aria-current={n === ACTIVE_NETWORK ? 'page' : undefined}
+                className="rounded-full px-2.5 py-1 capitalize"
+                style={n === ACTIVE_NETWORK ? { background: 'var(--accent)', color: '#0d1b2f' } : { color: 'var(--subtle)' }}
+              >
+                {n}
+              </a>
+            ))}
+          </nav>
           <ConnectKitButton />
         </div>
       </div>

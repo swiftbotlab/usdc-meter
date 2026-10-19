@@ -10,3 +10,4 @@ out/
 console.jsonl
 traces.jsonl
 .DS_Store
+__pycache__/

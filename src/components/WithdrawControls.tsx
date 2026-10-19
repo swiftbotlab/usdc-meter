@@ -149,7 +149,8 @@ export function WithdrawControls({ provider, onAction }: Props) {
       <h3 className="mb-1 text-sm font-semibold" style={{ color: 'var(--ink)' }}>Withdraw controls</h3>
       <p className="mb-4 flex items-start gap-1.5 text-xs" style={{ color: 'var(--subtle)' }}>
         <Info className="mt-0.5 size-3 shrink-0" />
-        The provider can still redeem outstanding vouchers during the notice period.
+        The provider can still redeem outstanding vouchers during the notice period, and stops serving calls once you
+        start. Deposits are blocked while a withdrawal is pending (cancel it to add funds).
         {noticePeriod !== undefined && (
           <span className="font-medium"> Notice period: {Number(noticePeriod)}s.</span>
         )}

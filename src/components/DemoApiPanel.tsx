@@ -1,6 +1,5 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { useSignTypedData, useAccount, useReadContract } from 'wagmi'
-import { recoverTypedDataAddress } from 'viem'
 import { parseEther, formatEther } from 'viem'
 import { Copy, Check, ChevronDown, ChevronUp, AlertCircle } from 'lucide-react'
 import {
@@ -12,6 +11,7 @@ import {
   voucherStorageKey,
   type StoredVoucher,
 } from '../usdcmeter-config'
+import { checkVoucher, parseVoucher } from '../voucher-check'
 
 const FAKE_RESPONSES = [
   { quote: '"Simplicity is the ultimate sophistication." — Leonardo da Vinci' },
@@ -22,6 +22,7 @@ const FAKE_RESPONSES = [
 ]
 
 interface CallLogEntry {
+  id: number
   index: number
   cumulative: string
   signature: string
@@ -35,18 +36,37 @@ interface Props {
   onVoucherSigned?: (v: StoredVoucher) => void
 }
 
+function lsGet(key: string): string | null {
+  try { return localStorage.getItem(key) } catch { return null }
+}
+function lsSet(key: string, value: string) {
+  try { localStorage.setItem(key, value) } catch { /* storage blocked */ }
+}
+
+/** The simulated provider's own memory: the highest cumulative it has accepted (and served) for this channel. */
+function acceptedKey(meter: string, client: string, provider: string) {
+  return `usdcmeter:provider-accepted:${ACTIVE_CHAIN.id}:${meter}:${client.toLowerCase()}:${provider.toLowerCase()}`
+}
+const PRICE_KEY = `usdcmeter:price:${ACTIVE_CHAIN.id}`
+
 export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
   const { address, chainId } = useAccount()
-  const [pricePerCall, setPricePerCall] = useState('0.01')
+  // persisted, so switching the Client/Provider tab (which remounts this panel) keeps the price
+  const [pricePerCall, setPricePerCall] = useState(() => lsGet(PRICE_KEY) ?? '0.01')
   const [log, setLog] = useState<CallLogEntry[]>([])
   const [collapsed, setCollapsed] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const inFlight = useRef(false) // synchronous guard: a double click in the same tick signs only once
+  const logId = useRef(0)
+
+  useEffect(() => { if (pricePerCall) lsSet(PRICE_KEY, pricePerCall) }, [pricePerCall])
 
   const cfg = ACTIVE_CFG
   const { signTypedDataAsync } = useSignTypedData()
 
-  // Read channel to know available balance and on-chain redeemed
-  const { data: channelData } = useReadContract({
+  // Read channel to know available balance, on-chain redeemed and withdrawal state
+  const { data: channelData, refetch } = useReadContract({
     address: cfg?.address,
     abi: METER_ABI,
     functionName: 'getChannel',
@@ -56,126 +76,132 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
   })
 
   const available: bigint = channelData ? (channelData[4]) : 0n
-  // Fix 1: on-chain redeemed — the authoritative floor for the next cumulative
   const onChainRedeemed: bigint = channelData ? BigInt(String(channelData[2])) : 0n
+  const withdrawReadyAt: number = channelData ? Number(channelData[3]) : 0
 
-  // Recover last cumulative from localStorage
+  // Latest voucher this client signed (localStorage, untrusted: parsed defensively)
   const getStoredVoucher = useCallback((): StoredVoucher | null => {
     if (!address || !provider || !cfg) return null
-    const key = voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, address, provider)
-    const raw = localStorage.getItem(key)
-    return raw ? (JSON.parse(raw) as StoredVoucher) : null
+    const { v } = parseVoucher(lsGet(voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, address, provider)))
+    return v ?? null
   }, [address, provider, cfg])
 
   const storeVoucher = useCallback(
     (v: StoredVoucher) => {
       if (!address || !provider || !cfg) return
-      const key = voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, address, provider)
-      localStorage.setItem(key, JSON.stringify(v))
+      lsSet(voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, address, provider), JSON.stringify(v))
     },
     [address, provider, cfg],
   )
 
+  const getAccepted = useCallback((): bigint => {
+    if (!address || !provider || !cfg) return 0n
+    const raw = lsGet(acceptedKey(cfg.address, address, provider))
+    return raw && /^\d{1,78}$/.test(raw) ? BigInt(raw) : 0n
+  }, [address, provider, cfg])
+
+  const addLog = (e: Omit<CallLogEntry, 'id'>) => {
+    logId.current += 1
+    const entry = { ...e, id: logId.current }
+    setLog((prev) => [entry, ...prev.slice(0, 19)])
+  }
+
   const handleCall = async () => {
     if (!address || !provider || !cfg) return
-
-    let price: bigint
-    try { price = parseEther(pricePerCall) } catch { return }
-    if (price === 0n) return
-
-    const stored = getStoredVoucher()
-    const storedCumulative = stored ? BigInt(stored.cumulativeAmount) : 0n
-
-    // Fix 1: base = max(stored cumulative, on-chain redeemed)
-    const base = storedCumulative > onChainRedeemed ? storedCumulative : onChainRedeemed
-    const newCumulative = base + price
-
-    // Check balance before signing: the new spend on top of what's already redeemed
-    const wouldSpend = newCumulative - onChainRedeemed
-    if (wouldSpend > available) {
-      setLog((prev) => [
-        {
-          index: (stored?.callCount ?? 0) + 1,
-          cumulative: formatEther(newCumulative),
-          signature: '',
-          verified: false,
-          reason: `Insufficient available balance (need ${formatEther(wouldSpend)}, have ${formatEther(available)} USDC)`,
-        },
-        ...prev,
-      ])
-      return
-    }
-
-    let sig: `0x${string}`
+    if (inFlight.current) return
+    inFlight.current = true
+    setBusy(true)
     try {
-      sig = await signTypedDataAsync({
-        domain: voucherDomain(ACTIVE_CHAIN.id, cfg.address),
-        types: VOUCHER_TYPES,
-        primaryType: 'Voucher',
-        message: { client: address, provider, cumulativeAmount: newCumulative },
-      })
-    } catch {
-      return // user rejected
-    }
+      let price: bigint
+      try { price = parseEther(pricePerCall) } catch { return }
+      if (price === 0n) return
 
-    // Fix 1: Simulated provider verification — also checks newCumulative > redeemed and spend <= available
-    let verified = false
-    let reason: string | undefined
-    try {
-      const recovered = await recoverTypedDataAddress({
-        domain: voucherDomain(ACTIVE_CHAIN.id, cfg.address),
-        types: VOUCHER_TYPES,
-        primaryType: 'Voucher',
-        message: { client: address, provider, cumulativeAmount: newCumulative },
-        signature: sig,
-      })
-      if (recovered.toLowerCase() !== address.toLowerCase()) {
-        reason = 'Signer mismatch'
-      } else if (newCumulative <= onChainRedeemed) {
-        // Fix 1: must exceed on-chain redeemed, not just stored cumulative
-        reason = `Cumulative (${formatEther(newCumulative)}) must exceed on-chain redeemed (${formatEther(onChainRedeemed)})`
-      } else if (newCumulative - onChainRedeemed > available) {
-        // Fix 1: (newCumulative - redeemed) must not exceed available
-        reason = 'Exceeds available balance'
-      } else {
-        verified = true
+      // fresh channel state right before deciding (not the 4 s poll)
+      const fresh = (await refetch()).data ?? channelData
+      if (!fresh) return
+      const redeemedNow = BigInt(String(fresh[2]))
+      const availNow: bigint = fresh[4]
+      const readyNow = Number(fresh[3])
+
+      const stored = getStoredVoucher()
+      const storedCumulative = stored ? BigInt(stored.cumulativeAmount) : 0n
+      const accepted = getAccepted()
+      const callCount = (stored?.callCount ?? 0) + 1
+
+      // The provider refuses service while a withdrawal is pending or matured: don't sign anything.
+      if (readyNow !== 0) {
+        addLog({ index: callCount, cumulative: formatEther(storedCumulative), signature: '', verified: false,
+          reason: 'Refused: a withdrawal is pending. The provider stops serving until you cancel it.' })
+        return
       }
-    } catch {
-      reason = 'Signature verification failed'
-    }
 
-    const callCount = (stored?.callCount ?? 0) + 1
-    const newVoucher: StoredVoucher = {
-      client: address,
-      provider,
-      cumulativeAmount: newCumulative.toString(),
-      signature: sig,
-      callCount,
-      pricePerCall: price.toString(),
-    }
-    storeVoucher(newVoucher)
-    onVoucherSigned?.(newVoucher)
+      // Next cumulative = max(what I signed, what was redeemed, what the provider says it accepted) + price.
+      // (A real API returns its last accepted cumulative with each response; here it is simulated.)
+      let base = storedCumulative > redeemedNow ? storedCumulative : redeemedNow
+      if (accepted > base) base = accepted
+      const newCumulative = base + price
 
-    const fakeResponse = verified
-      ? FAKE_RESPONSES[callCount % FAKE_RESPONSES.length].quote
-      : undefined
+      // Never sign beyond the prepaid balance
+      const wouldSpend = newCumulative - redeemedNow
+      if (wouldSpend > availNow) {
+        addLog({ index: callCount, cumulative: formatEther(newCumulative), signature: '', verified: false,
+          reason: `Insufficient available balance (need ${formatEther(wouldSpend)}, have ${formatEther(availNow)} USDC)` })
+        return
+      }
 
-    setLog((prev) => [
-      {
+      let sig: `0x${string}`
+      try {
+        sig = await signTypedDataAsync({
+          domain: voucherDomain(ACTIVE_CHAIN.id, cfg.address),
+          types: VOUCHER_TYPES,
+          primaryType: 'Voucher',
+          message: { client: address, provider, cumulativeAmount: newCumulative },
+        })
+      } catch {
+        return // user rejected
+      }
+
+      const newVoucher: StoredVoucher = {
+        client: address,
+        provider,
+        cumulativeAmount: newCumulative.toString(),
+        signature: sig,
+        callCount,
+        pricePerCall: price.toString(),
+      }
+      storeVoucher(newVoucher)
+      onVoucherSigned?.(newVoucher)
+
+      // Simulated provider: same checks a real provider runs before serving (see src/voucher-check.ts)
+      const res = await checkVoucher({
+        v: newVoucher,
+        chainId: ACTIVE_CHAIN.id,
+        meter: cfg.address,
+        expectedClient: address,
+        self: provider,
+        channel: { redeemed: redeemedNow, available: availNow, withdrawReadyAt: readyNow },
+        minCumulative: (accepted > redeemedNow ? accepted : redeemedNow) + price,
+        forServing: true,
+      })
+      if (res.ok) lsSet(acceptedKey(cfg.address, address, provider), newCumulative.toString())
+
+      addLog({
         index: callCount,
         cumulative: formatEther(newCumulative),
         signature: sig,
-        verified,
-        reason,
-        response: fakeResponse,
-      },
-      ...prev.slice(0, 19),
-    ])
+        verified: res.ok,
+        reason: res.ok ? undefined : res.error,
+        response: res.ok ? FAKE_RESPONSES[callCount % FAKE_RESPONSES.length].quote : undefined,
+      })
+    } finally {
+      inFlight.current = false
+      setBusy(false)
+    }
   }
 
   const latestVoucher = getStoredVoucher()
 
-  // Fix 1: base for the display is max(stored, on-chain redeemed)
+  // base for the display is max(stored, on-chain redeemed)
   const storedCumulative = latestVoucher ? BigInt(latestVoucher.cumulativeAmount) : 0n
   const displayBase = storedCumulative > onChainRedeemed ? storedCumulative : onChainRedeemed
 
@@ -193,7 +219,7 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
     border: '1px solid var(--border)',
   }
 
-  const canCall = !!address && !!provider && !!pricePerCall && chainId === ACTIVE_CHAIN.id && !!cfg
+  const canCall = !!address && !!provider && !!pricePerCall && chainId === ACTIVE_CHAIN.id && !!cfg && !busy
 
   if (!cfg) {
     return (
@@ -217,8 +243,9 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
         </span>
       </div>
       <p className="mb-4 text-xs" style={{ color: 'var(--subtle)' }}>
-        Each click signs a cumulative EIP-712 voucher. The simulated provider verifies it in-browser.
-        No gas per call.
+        Each click signs a cumulative EIP-712 voucher (no gas per call). The simulated provider checks it the way a real
+        one should: signer, canonical signature, cumulative ≥ last accepted + price, within the prepaid balance, and no
+        withdrawal pending.
       </p>
 
       {/* Price input */}
@@ -255,6 +282,13 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
         )}
       </div>
 
+      {withdrawReadyAt !== 0 && (
+        <div className="mb-3 flex items-center gap-2 rounded-xl px-3 py-2 text-xs" style={{ background: 'rgba(255,200,80,0.12)', color: '#c9a020' }}>
+          <AlertCircle className="size-3.5 shrink-0" />
+          Withdrawal pending: the provider stops serving calls (and redeems) until you cancel it.
+        </div>
+      )}
+
       {available === 0n && (
         <div className="mb-3 flex items-center gap-2 rounded-xl px-3 py-2 text-xs" style={{ background: 'rgba(232,109,122,0.12)', color: 'var(--danger)' }}>
           <AlertCircle className="size-3.5 shrink-0" />
@@ -268,7 +302,7 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
         className="mb-4 flex w-full items-center justify-center gap-2 rounded-2xl py-3 text-sm font-semibold transition-all hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
         style={{ background: 'var(--accent)', color: '#0d1b2f' }}
       >
-        Call the API
+        {busy ? 'Signing…' : 'Call the API'}
       </button>
 
       {/* Latest voucher */}
@@ -313,7 +347,7 @@ export function DemoApiPanel({ provider, onVoucherSigned }: Props) {
             <div className="max-h-56 overflow-y-auto rounded-xl" style={{ background: 'var(--surface-muted)' }}>
               {log.map((entry) => (
                 <div
-                  key={entry.index}
+                  key={entry.id}
                   className="border-b px-3 py-2.5 last:border-b-0"
                   style={{ borderColor: 'var(--border)' }}
                 >

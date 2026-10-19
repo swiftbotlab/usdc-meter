@@ -216,7 +216,8 @@ function parseChainId(raw: unknown): number {
 let _enabled = false;
 
 window.addEventListener('message', (e: MessageEvent<MessageData>) => {
-  if (e.source !== window.parent) {
+  // only the Studio preview's parent may switch tracing on
+  if (e.source !== window.parent || e.origin !== 'https://studio.arc.io') {
     return;
   }
 

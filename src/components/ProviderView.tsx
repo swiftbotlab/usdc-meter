@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useWriteContract, useWaitForTransactionReceipt, useAccount, useSwitchChain, useReadContract, usePublicClient } from 'wagmi'
-import { recoverTypedDataAddress, parseAbiItem, formatEther } from 'viem'
+import { useWriteContract, useWaitForTransactionReceipt, useAccount, useSwitchChain, useReadContract } from 'wagmi'
+import { formatEther } from 'viem'
 import { toast } from 'sonner'
 import { ExternalLink, ClipboardPaste, AlertTriangle, Check } from 'lucide-react'
 import {
@@ -10,12 +10,12 @@ import {
   ACTIVE_CFG,
   explorerTx,
   explorerAddr,
-  voucherDomain,
-  VOUCHER_TYPES,
   voucherStorageKey,
   clientStorageKey,
   type StoredVoucher,
 } from '../usdcmeter-config'
+import { checkVoucher, parseVoucher, withdrawState, sameAddr } from '../voucher-check'
+import { useNowSec } from '../use-now'
 import { ChannelCard } from './ChannelCard'
 import { TxButton } from './TxButton'
 import { EventFeed } from './EventFeed'
@@ -30,6 +30,7 @@ function parseOnchainError(err: unknown): string {
   if (msg.includes('transferfailed')) return 'Native transfer to provider failed.'
   if (msg.includes('tooearlytowithdraw')) return 'Notice period has not elapsed yet.'
   if (msg.includes('withdrawalreadypending')) return 'A withdrawal is already pending.'
+  if (msg.includes('reentrancyguard')) return 'Re-entrant call rejected.'
   if (msg.includes('nopendingwithdraw')) return 'No pending withdrawal to complete.'
   if (msg.includes('noavailablebalance')) return 'No available balance to withdraw.'
   return 'Transaction failed. Try again.'
@@ -39,7 +40,6 @@ export function ProviderView() {
   const { address, chainId } = useAccount()
   const { switchChain } = useSwitchChain()
   const cfg = ACTIVE_CFG
-  const publicClient = usePublicClient({ chainId: ACTIVE_CHAIN.id })
 
   const [clientInput, setClientInput] = useState<string>(
     () => localStorage.getItem(clientStorageKey(ACTIVE_CHAIN.id)) ?? '',
@@ -48,7 +48,8 @@ export function ProviderView() {
   const [parsedVoucher, setParsedVoucher] = useState<StoredVoucher | null>(null)
   const [voucherError, setVoucherError] = useState('')
   const [isVerified, setIsVerified] = useState<boolean | null>(null)
-  const [withdrawAlert, setWithdrawAlert] = useState<string | null>(null)
+  const [redeemable, setRedeemable] = useState<bigint>(0n)
+  const nowSec = useNowSec()
   // Fix 4: bump this to trigger ChannelCard + EventFeed immediate refresh
   const [refreshKey, setRefreshKey] = useState(0)
   const queryClient = useQueryClient()
@@ -68,21 +69,18 @@ export function ProviderView() {
     }
   }, [clientInput])
 
-  // Auto-load voucher from localStorage when client or provider changes
+  // Auto-load the latest voucher from localStorage when client or provider changes. It is only put in the textarea;
+  // it becomes `parsedVoucher` after the same validation as a pasted one (untrusted data, may be corrupt).
   /* oxlint-disable react/set-state-in-effect */
   useEffect(() => {
-    if (!client || !address || !cfg) { setParsedVoucher(null); return }
-    const key = voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, client, address)
-    const raw = localStorage.getItem(key)
+    setParsedVoucher(null)
+    setIsVerified(null)
+    if (!client || !address || !cfg) return
+    let raw: string | null = null
+    try { raw = localStorage.getItem(voucherStorageKey(ACTIVE_CHAIN.id, cfg.address, client, address)) } catch { /* storage blocked */ }
     if (raw) {
-      try {
-        const v = JSON.parse(raw) as StoredVoucher
-        setParsedVoucher(v)
-        setVoucherJson(JSON.stringify(v, null, 2))
-        autoLoadedRef.current = true
-      } catch {
-        setParsedVoucher(null)
-      }
+      setVoucherJson(raw)
+      autoLoadedRef.current = true
     }
   }, [client, address, cfg])
   /* oxlint-enable react/set-state-in-effect */
@@ -99,100 +97,39 @@ export function ProviderView() {
 
   const available: bigint = channelData ? (channelData[4]) : 0n
   const redeemed: bigint = channelData ? BigInt(String(channelData[2])) : 0n
+  const withdrawReadyAt: number = channelData ? Number(channelData[3]) : 0
+  // Withdrawal state comes from the channel itself (polled every 5 s), not from a log scan: it can't be missed,
+  // it covers the matured state, and it clears as soon as the client cancels or completes.
+  const wState = withdrawState(withdrawReadyAt, nowSec)
 
-  // Parse and validate pasted voucher
+  // Parse and validate the voucher (pasted, or auto-loaded) against the SELECTED channel
   const handleParseVoucher = useCallback(async () => {
-    setVoucherError('')
-    setIsVerified(null)
+    // results are set together at the end (no flicker on the 5 s re-validation)
+    const reject = (msg: string) => { setParsedVoucher(null); setRedeemable(0n); setVoucherError(msg); setIsVerified(false) }
     if (!cfg || !address) return
-    let v: StoredVoucher
-    try { v = JSON.parse(voucherJson) as StoredVoucher } catch {
-      setVoucherError('Invalid JSON')
+    const { v, error } = parseVoucher(voucherJson)
+    if (!v) { reject(error ?? 'Invalid voucher'); return }
+    if (!client) {
+      // no client selected yet: take it from the voucher, the effect below re-validates once the channel loads
+      autoLoadedRef.current = true
+      setClientInput(v.client)
       return
     }
-    if (!v.client || !v.provider || !v.cumulativeAmount || !v.signature) {
-      setVoucherError('Missing required fields')
-      return
-    }
-    if (v.provider.toLowerCase() !== address.toLowerCase()) {
-      setVoucherError(`Voucher is for provider ${v.provider} — that is not your address.`)
-      return
-    }
-    // Verify signature
-    try {
-      const recovered = await recoverTypedDataAddress({
-        domain: voucherDomain(ACTIVE_CHAIN.id, cfg.address),
-        types: VOUCHER_TYPES,
-        primaryType: 'Voucher',
-        message: {
-          client: v.client as `0x${string}`,
-          provider: v.provider as `0x${string}`,
-          cumulativeAmount: BigInt(v.cumulativeAmount),
-        },
-        signature: v.signature as `0x${string}`,
-      })
-      if (recovered.toLowerCase() !== v.client.toLowerCase()) {
-        setVoucherError('Signature does not match client')
-        setIsVerified(false)
-        return
-      }
-    } catch {
-      setVoucherError('Signature verification failed')
-      setIsVerified(false)
-      return
-    }
-    const cumulative = BigInt(v.cumulativeAmount)
-    if (cumulative <= redeemed) {
-      setVoucherError(`Cumulative ${formatEther(cumulative)} ≤ already redeemed ${formatEther(redeemed)}. Nothing to pay.`)
-      setIsVerified(false)
-      return
-    }
+    if (!channelData) { setVoucherError('Loading channel…'); setIsVerified(null); return }
+    const res = await checkVoucher({
+      v,
+      chainId: ACTIVE_CHAIN.id,
+      meter: cfg.address,
+      expectedClient: client,
+      self: address,
+      channel: { redeemed, available, withdrawReadyAt },
+    })
+    if (!res.ok) { reject(res.error ?? 'Invalid voucher'); return }
+    setVoucherError('')
     setParsedVoucher(v)
+    setRedeemable(res.redeemable)
     setIsVerified(true)
-  }, [voucherJson, cfg, address, redeemed])
-
-  // Compute redeemable
-  const redeemable: bigint = parsedVoucher
-    ? (() => {
-        const c = BigInt(parsedVoucher.cumulativeAmount)
-        const owed: bigint = c > redeemed ? c - redeemed : 0n
-        return owed < available ? owed : available
-      })()
-    : 0n
-
-  // Watch WithdrawRequested events for this channel
-  /* oxlint-disable react/set-state-in-effect */
-  useEffect(() => {
-    if (!publicClient || !cfg || !client || !address) return
-    let cancelled = false
-    const run = async () => {
-      try {
-        const head = await publicClient.getBlockNumber({ cacheTime: 0 }) // fresh head: the default 4 s cache missed a just-confirmed event
-        const from = head > 500n ? head - 500n : cfg.deployBlock
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const logs: unknown[] = await (publicClient.getLogs as (...a: unknown[]) => Promise<unknown[]>)({
-          address: cfg.address,
-          event: parseAbiItem('event WithdrawRequested(address indexed client, address indexed provider, uint64 readyAt)'),
-          args: { client: [client], provider: [address] },
-          fromBlock: from,
-          toBlock: head,
-        })
-        if (!cancelled && logs.length > 0) {
-          const last = logs[logs.length - 1] as Record<string, unknown>
-          const args = (last.args ?? {}) as Record<string, unknown>
-          const readyAt = Number(args.readyAt as bigint | undefined ?? 0n)
-          // oxlint-disable-next-line react/purity -- comparing to current wall time is intentional
-          const now = Math.floor(Date.now() / 1000)
-          if (readyAt > now) {
-            setWithdrawAlert(`Client started a withdrawal — redeem before ${new Date(readyAt * 1000).toLocaleString()}`)
-          }
-        }
-      } catch { /* ignore */ }
-    }
-    void run()
-    return () => { cancelled = true }
-  }, [publicClient, cfg, client, address])
-  /* oxlint-enable react/set-state-in-effect */
+  }, [voucherJson, cfg, address, client, channelData, redeemed, available, withdrawReadyAt])
 
   // Redeem
   const { writeContract, data: redeemHash, isPending: redeemPending } = useWriteContract()
@@ -200,14 +137,15 @@ export function ProviderView() {
 
   const handleRedeem = () => {
     if (wrongChain) { switchChain({ chainId: ACTIVE_CHAIN.id }); return }
-    if (!cfg || !parsedVoucher || !client) return
+    if (!cfg || !parsedVoucher || !client || !isVerified) return
+    if (!sameAddr(parsedVoucher.client, client) || !sameAddr(parsedVoucher.provider, address)) return
     writeContract(
       {
         address: cfg.address,
         abi: METER_ABI,
         functionName: 'redeem',
         args: [
-          client,
+          parsedVoucher.client as `0x${string}`,
           parsedVoucher.provider as `0x${string}`,
           BigInt(parsedVoucher.cumulativeAmount),
           parsedVoucher.signature as `0x${string}`,
@@ -242,8 +180,9 @@ export function ProviderView() {
 
   // Auto-validate a voucher loaded from localStorage, and re-validate when the channel's redeemed/available change.
   useEffect(() => {
-    if (!autoLoadedRef.current || !voucherJson || !client || !address || !channelData) return
+    if (!(autoLoadedRef.current || isVerified) || !voucherJson || !client || !address || !channelData) return
     void handleParseVoucher()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isVerified only gates; re-run on channel/voucher changes
   }, [handleParseVoucher, voucherJson, client, address, channelData, available])
   /* oxlint-enable react/set-state-in-effect */
 
@@ -268,14 +207,24 @@ export function ProviderView() {
 
   return (
     <div className="flex flex-col gap-5">
-      {/* Withdraw alert */}
-      {withdrawAlert && (
+      {/* Withdrawal alert, driven by getChannel().withdrawReadyAt */}
+      {client && wState !== 'none' && (
         <div
+          role="alert"
           className="flex items-start gap-2 rounded-2xl p-4 text-sm"
-          style={{ background: 'rgba(255,200,80,0.12)', border: '1px solid rgba(201,160,32,0.3)', color: '#c9a020' }}
+          style={{ background: 'rgba(232,109,122,0.14)', border: '1px solid rgba(232,109,122,0.45)', color: 'var(--danger)' }}
         >
           <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-          <div>{withdrawAlert}</div>
+          <div>
+            <div className="font-semibold">
+              {wState === 'pending'
+                ? `Client started a withdrawal: stop serving and redeem now (it can complete at ${new Date(withdrawReadyAt * 1000).toLocaleTimeString()}).`
+                : 'Withdrawal notice has ended: the client can take the remaining balance at any moment. Redeem now.'}
+            </div>
+            <div className="mt-0.5 text-xs" style={{ opacity: 0.85 }}>
+              New deposits are blocked until the client cancels or completes the withdrawal.
+            </div>
+          </div>
         </div>
       )}
 
@@ -305,7 +254,7 @@ export function ProviderView() {
       </div>
 
       {/* Channel card — fix 4: pass refreshKey */}
-      <ChannelCard client={client} provider={address} refreshKey={refreshKey} />
+      <ChannelCard client={client} provider={address} refreshKey={refreshKey} perspective="provider" />
 
       {/* Voucher panel */}
       <div className="rounded-2xl p-5" style={glass}>
@@ -316,7 +265,7 @@ export function ProviderView() {
 
         <textarea
           value={voucherJson}
-          onChange={(e) => { autoLoadedRef.current = false; setVoucherJson(e.target.value); setIsVerified(null) }}
+          onChange={(e) => { autoLoadedRef.current = false; setVoucherJson(e.target.value); setIsVerified(null); setParsedVoucher(null) }}
           placeholder={'{\n  "client": "0x…",\n  "provider": "0x…",\n  "cumulativeAmount": "1000000000000000000",\n  "signature": "0x…"\n}'}
           rows={5}
           className="mono w-full resize-none rounded-xl px-3 py-2.5 text-xs outline-none"

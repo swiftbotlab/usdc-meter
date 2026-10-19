@@ -9,8 +9,12 @@ Environment:
   PROVIDER_PK     provider key (redeem) - any funded key can submit a redeem; funds always go to the voucher's provider
 
   meter_client.py deposit PROVIDER AMOUNT_USDC
-  meter_client.py sign PROVIDER CUMULATIVE_USDC            > voucher.json   (off-chain, no gas)
-  meter_client.py verify voucher.json                      provider-side check before serving a call
+  meter_client.py sign PROVIDER CUMULATIVE_USDC            > voucher.json   (off-chain, no gas; refuses to sign
+                                                            beyond the prepaid balance)
+  meter_client.py verify voucher.json PRICE_USDC [STATE]   provider-side check before serving ONE call of PRICE_USDC.
+                                                            The provider is PROVIDER_PK's address (or PROVIDER_ADDRESS).
+                                                            STATE (default ./accepted.json) remembers the highest
+                                                            cumulative accepted per channel; it is updated on success.
   meter_client.py redeem voucher.json
   meter_client.py channel CLIENT PROVIDER
   meter_client.py request-withdraw PROVIDER | cancel-withdraw PROVIDER | complete-withdraw PROVIDER
@@ -31,6 +35,7 @@ NETWORKS = {
 NET = NETWORKS[os.environ.get("ARC_NETWORK", "testnet")]
 METER = to_checksum_address(os.environ["METER_ADDRESS"])
 FEE_FLOOR = 20 * 10**9  # Arc rejects maxFeePerGas below 20 gwei
+SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
 def rpc(method, params):
@@ -91,14 +96,58 @@ def send(pk_env, data, value=0):
     print(json.dumps({"tx": h, "status": "pending"}))
 
 
-def verify(v):
-    """What a provider runs before serving a paid call: signer, provider, monotonic amount, funded."""
-    msg = encode_typed_data(full_message=typed(v["client"], v["provider"], int(v["cumulativeAmount"])))
-    signer = Account.recover_message(msg, signature=v["signature"])
-    ch = channel(v["client"], v["provider"])
-    cum = int(v["cumulativeAmount"])
-    ok = signer.lower() == v["client"].lower() and cum > ch["redeemed"] and cum - ch["redeemed"] <= ch["available"]
-    return {"ok": ok, "signer": signer, "owed": str(cum - ch["redeemed"]), "available": str(ch["available"])}
+def canonical(sig_hex):
+    """The only signature form UsdcMeter accepts (OpenZeppelin ECDSA): 65 bytes, v 27/28, low s."""
+    b = bytes.fromhex(sig_hex.removeprefix("0x"))
+    if len(b) != 65:
+        return False
+    s = int.from_bytes(b[32:64], "big")
+    return b[64] in (27, 28) and 0 < s <= SECP_N // 2
+
+
+def my_provider_address():
+    if os.environ.get("PROVIDER_ADDRESS"):
+        return to_checksum_address(os.environ["PROVIDER_ADDRESS"])
+    return Account.from_key(os.environ["PROVIDER_PK"]).address
+
+
+def verify(v, price, state_path="accepted.json"):
+    """What a provider runs before serving ONE paid call of `price` wei. Rules (all must hold):
+    - the voucher pays ME (v.provider == my address) and is signed by v.client in canonical form
+    - no withdrawal is pending or matured on the channel (withdrawReadyAt != 0 -> stop serving, redeem now)
+    - cumulative >= max(highest cumulative I already accepted, on-chain redeemed) + price  (no replay, no free call)
+    - cumulative - redeemed <= available (the call is prepaid)
+    On success the accepted cumulative is persisted in state_path."""
+    me = my_provider_address()
+    client, cum = to_checksum_address(v["client"]), int(v["cumulativeAmount"])
+    key = f"{NET['chain']}:{METER}:{client}:{me}".lower()
+    try:
+        state = json.load(open(state_path))
+    except FileNotFoundError:
+        state = {}
+    last = int(state.get(key, 0))
+    ch = channel(client, me)
+    out = {"ok": False, "provider": me, "client": client, "cumulative": str(cum), "last_accepted": str(last),
+           "redeemed": str(ch["redeemed"]), "available": str(ch["available"]), "withdrawReadyAt": ch["withdrawReadyAt"]}
+    if to_checksum_address(v["provider"]) != me:
+        return {**out, "reason": "voucher pays another provider"}
+    if not canonical(v["signature"]):
+        return {**out, "reason": "non-canonical signature (the contract would reject it)"}
+    msg = encode_typed_data(full_message=typed(client, me, cum))
+    if Account.recover_message(msg, signature=v["signature"]).lower() != client.lower():
+        return {**out, "reason": "signer is not the client"}
+    if ch["withdrawReadyAt"] != 0:
+        return {**out, "reason": "client started a withdrawal: stop serving and redeem now"}
+    if cum < max(last, ch["redeemed"]) + price:
+        return {**out, "reason": "cumulative does not cover this call (replay or below last accepted + price)"}
+    if cum - ch["redeemed"] > ch["available"]:
+        return {**out, "reason": "voucher exceeds the prepaid balance"}
+    state[key] = str(cum)
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_path)
+    return {**out, "ok": True, "reason": "ok"}
 
 
 def main():
@@ -111,11 +160,19 @@ def main():
     elif cmd == "sign":
         acct = Account.from_key(os.environ["CLIENT_PK"])
         provider, cum = to_checksum_address(a[0]), wei(a[1])
+        ch = channel(acct.address, provider)
+        if ch["withdrawReadyAt"] != 0:
+            sys.exit("a withdrawal is pending on this channel; the provider will not serve (cancel it first)")
+        if cum <= ch["redeemed"] or cum - ch["redeemed"] > ch["available"]:
+            sys.exit("refusing to sign: cumulative must be above redeemed and within the prepaid balance "
+                     f"(redeemed {ch['redeemed']}, available {ch['available']} wei)")
         sig = acct.sign_message(encode_typed_data(full_message=typed(acct.address, provider, cum))).signature
         print(json.dumps({"client": acct.address, "provider": provider, "cumulativeAmount": str(cum),
                           "signature": "0x" + sig.hex().removeprefix("0x")}))
     elif cmd == "verify":
-        print(json.dumps(verify(json.load(open(a[0])))))
+        r = verify(json.load(open(a[0])), wei(a[1]), a[2] if len(a) > 2 else "accepted.json")
+        print(json.dumps(r))
+        sys.exit(0 if r["ok"] else 1)
     elif cmd == "redeem":
         v = json.load(open(a[0]))
         data = selector_call("redeem(address,address,uint256,bytes)", ["address", "address", "uint256", "bytes"],

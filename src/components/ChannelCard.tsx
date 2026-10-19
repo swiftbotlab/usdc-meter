@@ -9,6 +9,8 @@ interface Props {
   provider: `0x${string}` | undefined
   /** External refetch trigger — bump to force an immediate refresh. */
   refreshKey?: number
+  /** Whose view this is: a matured withdrawal is good news for the client and a red flag for the provider. */
+  perspective?: 'client' | 'provider'
 }
 
 function useCountdown(targetTs: number | undefined): string {
@@ -41,7 +43,7 @@ function fmt(raw: bigint) {
   })
 }
 
-export function ChannelCard({ client, provider, refreshKey }: Props) {
+export function ChannelCard({ client, provider, refreshKey, perspective = 'client' }: Props) {
   const { chainId } = useAccount()
   const { switchChain } = useSwitchChain()
   const cfg = ACTIVE_CFG
@@ -78,9 +80,13 @@ export function ChannelCard({ client, provider, refreshKey }: Props) {
   const isReady = !!withdrawReadyAt && withdrawReadyAt > 0 && withdrawReadyAt <= nowSec
 
   const statusBadge = isReady
-    ? { label: 'Ready to withdraw', bg: 'rgba(141,216,159,0.18)', color: 'var(--success)' }
+    ? perspective === 'provider'
+      ? { label: 'Client can withdraw now', bg: 'rgba(232,109,122,0.18)', color: 'var(--danger)' }
+      : { label: 'Ready to withdraw', bg: 'rgba(141,216,159,0.18)', color: 'var(--success)' }
     : isPending
-    ? { label: `Withdrawal pending · ${countdown}`, bg: 'rgba(255,200,80,0.15)', color: '#c9a020' }
+    ? perspective === 'provider'
+      ? { label: `Client withdrawing · ${countdown}`, bg: 'rgba(232,109,122,0.18)', color: 'var(--danger)' }
+      : { label: `Withdrawal pending · ${countdown}`, bg: 'rgba(255,200,80,0.15)', color: '#c9a020' }
     : { label: 'Open', bg: 'rgba(172,198,233,0.15)', color: 'var(--accent)' }
 
   const deposited: bigint = data ? (data[0]) : 0n

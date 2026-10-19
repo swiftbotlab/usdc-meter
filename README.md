@@ -6,8 +6,9 @@ Prepaid metered billing in USDC on Arc. One deposit, a signed voucher per API ca
 
 Paying per API call on-chain normally means one transaction per call: fees and latency on every request. Invoices and subscriptions avoid that but bring credit risk and manual billing. USDC Meter sits in between. A client deposits USDC once into a channel for a provider. Every call carries an off-chain EIP-712 voucher that states the **cumulative** amount the client owes so far. The provider redeems the latest voucher whenever it likes and the contract pays only the difference over what was already redeemed. It is a minimal one-way payment channel, built for services or agents paying each other per call.
 
-- Live app: https://usdc-meter.netlify.app (Arc Testnet)
-- Contract: [`contracts/UsdcMeter.sol`](contracts/UsdcMeter.sol) (about 300 lines, OpenZeppelin EIP712 + ECDSA + ReentrancyGuard)
+- Live app: https://swiftbotlab.github.io/usdc-meter/ (GitHub Pages, built from this repo) and https://usdc-meter.netlify.app (Netlify).
+  Both serve Arc Testnet by default; `?network=mainnet` switches to Arc mainnet (also available as a toggle in the header).
+- Contract: [`contracts/UsdcMeter.sol`](contracts/UsdcMeter.sol) (v2, about 320 lines, OpenZeppelin EIP712 + ECDSA + ReentrancyGuard)
 - Built in [Arc Studio](https://studio.arc.io): Smart Contract mode for the contract (writer, two auditors, Slither, Foundry tests, deploy), Build mode for the app
 
 ---
@@ -18,13 +19,12 @@ Paying per API call on-chain normally means one transaction per call: fees and l
 Client                         UsdcMeter                        Provider
   |-- deposit(provider) {value} -->|                                 |
   |                                |  channel(client, provider)      |
-  |== API call #1 + voucher(0.05) ==================================>|  verify off-chain, serve
-  |== API call #2 + voucher(0.10) ==================================>|  verify off-chain, serve
-  |== API call #3 + voucher(0.15) ==================================>|  verify off-chain, serve
-  |                                |<--- redeem(voucher 0.15) -------|  pays 0.15
-  |-- requestWithdraw(provider) -->|  notice period starts           |
-  |== API call #4 + voucher(0.20) ==================================>|
-  |                                |<--- redeem(voucher 0.20) -------|  pays 0.05 (the delta)
+  |== API call #1 + voucher(0.02) ==================================>|  check, serve
+  |== API call #2 + voucher(0.04) ==================================>|  check, serve
+  |   ...                                                            |
+  |                                |<--- redeem(latest voucher) -----|  pays the delta
+  |-- requestWithdraw(provider) -->|  notice period starts           |  sees withdrawReadyAt != 0:
+  |                                |<--- redeem(newest voucher) -----|  stops serving, redeems now
   |-- completeWithdraw(provider) ->|  (after notice) client gets the rest
 ```
 
@@ -39,48 +39,57 @@ Voucher(address client, address provider, uint256 cumulativeAmount)
 domain = { name: "USDC Meter", version: "1", chainId, verifyingContract }
 ```
 
-- **Cumulative, not per-call.** Each voucher states the total owed so far. The provider only needs to keep the latest one; losing older vouchers costs nothing, and replaying an old voucher pays nothing (`cumulativeAmount <= redeemed` reverts with `NothingToRedeem`).
+- **Cumulative, not per-call.** Each voucher states the total owed so far. The provider only needs to keep the latest one; replaying an old voucher pays nothing (`cumulativeAmount <= redeemed` reverts with `NothingToRedeem`).
 - **Bound to one chain and one contract** through the EIP-712 domain, so a voucher can't be replayed on another deployment or network.
-- **EOA signatures only** (`ECDSA.tryRecover`, malleable signatures rejected). ERC-1271 contract signatures are deliberately not accepted: a contract wallet could change its signature logic and invalidate vouchers the provider already holds.
-- **Partial redemption.** If a voucher asks for more than the channel holds, the provider receives what is available and the rest stays claimable with the same voucher after the client tops up.
+- **EOA signatures only.** OpenZeppelin `ECDSA.tryRecover`: exactly 65 bytes, `v` 27/28, low `s`. ERC-1271 contract signatures are deliberately not accepted (a contract wallet could change its logic and invalidate vouchers the provider already holds), so **the client must be an EOA** (EIP-7702 delegated EOAs work; the app warns if the connected wallet is a smart-contract account).
+- **Partial redemption.** If a voucher asks for more than the channel holds, the provider receives what is available and the rest stays claimable with the same voucher after a top-up.
+- **Lifetime-cumulative.** Amounts never reset for a `(client, provider)` pair, so an unredeemed voucher stays redeemable against later deposits, even after a full withdrawal. The client did sign for it; never sign beyond your balance (the app and `meter_client.py sign` refuse to).
 - **Permissionless submission.** Anyone may submit `redeem` (for example a relayer that pays the gas); the funds always go to the provider named in the voucher.
 
 ### Channel state
-
-One channel per `(client, provider)` pair:
 
 | Field | Meaning |
 |---|---|
 | `deposited` | total the client ever deposited |
 | `withdrawn` | total the client ever withdrew |
-| `redeemed` | total paid to the provider (equals the highest voucher redeemed, capped by funds) |
+| `redeemed` | total paid to the provider |
 | `withdrawReadyAt` | 0, or the time a requested withdrawal can complete |
 | `available` | `deposited - withdrawn - redeemed` |
 
-| Status in the app | Condition |
-|---|---|
-| Open | `withdrawReadyAt == 0` |
-| Withdrawal pending | `now < withdrawReadyAt`: the provider should redeem any outstanding voucher now |
-| Ready to withdraw | `withdrawReadyAt <= now`: the client can complete the withdrawal |
+| Status | Condition | Client view | Provider view |
+|---|---|---|---|
+| Open | `withdrawReadyAt == 0` | deposit, call, withdraw | serve calls |
+| Withdrawal pending | `now < withdrawReadyAt` | calls refused, deposits blocked | red banner: stop serving, redeem now |
+| Matured | `withdrawReadyAt <= now` | complete (or cancel) | red banner: client can leave at any moment |
 
 ### Functions
 
 | Function | Caller | Effect |
 |---|---|---|
-| `deposit(provider)` payable | client | adds `msg.value` to the channel; does not cancel a pending withdrawal |
+| `deposit(provider)` payable | client | adds `msg.value` to the channel; **reverts `WithdrawAlreadyPending` while a withdrawal is pending or matured** |
 | `redeem(client, provider, cumulativeAmount, signature)` | anyone | pays `min(cumulativeAmount - redeemed, available)` to the provider |
 | `requestWithdraw(provider)` | client | starts the notice period (`noticePeriod`, immutable, 60 s to 30 days) |
-| `cancelWithdraw(provider)` | client | clears a pending request |
+| `cancelWithdraw(provider)` | client | clears a pending request (deposits are possible again; a new request restarts the notice) |
 | `completeWithdraw(provider)` | client | after the notice period, sends everything still available to the client |
 | `getChannel`, `voucherDigest`, `domainSeparator`, `VOUCHER_TYPEHASH`, `noticePeriod` | view | helpers for apps and services |
 
-Events: `Deposited`, `Redeemed`, `WithdrawRequested`, `WithdrawCancelled`, `Withdrawn`.
+Events: `Deposited`, `Redeemed`, `WithdrawRequested`, `WithdrawCancelled`, `Withdrawn` (emitted before the payout transfer).
+
+### Provider checklist (before serving each call)
+
+`src/voucher-check.ts` (app) and `examples/python/meter_client.py verify` (backends) implement exactly this:
+
+1. `voucher.provider` is **my** address, and the signature recovers to `voucher.client` in canonical form (65 bytes, `v` 27/28, low `s`).
+2. `getChannel(client, me).withdrawReadyAt == 0`. Anything else means the client started a withdrawal: **stop serving and redeem the newest voucher now** (a matured request lets the client take the rest at any moment).
+3. `cumulative >= max(highest cumulative I already accepted, redeemed) + price`: no replays, no free calls. Keep that number per channel on the provider side.
+4. `cumulative - redeemed <= available`: the call is prepaid.
 
 ### Who carries what risk
 
 - **Client:** the provider can never take more than the client signed for, and never more than the channel holds.
-- **Provider:** if the provider checks each voucher before serving a call (signer, amount increased by exactly the price, `cumulative - redeemed <= available`), its exposure is at most one call. The client can only take funds back after the notice period, and the provider can redeem during that window, so a provider must watch for `WithdrawRequested` (the app shows a banner) and redeem before `withdrawReadyAt`.
+- **Provider:** with the checklist above, exposure is at most the calls served since the provider last looked at the channel. The contract guarantees that what can leave at withdrawal time was under notice for the full period (deposits are blocked while a request exists), so a provider that checks `withdrawReadyAt` well within the notice period (for example every quarter of it, or on every call) and redeems as soon as it sees a request is paid for everything it served. At `withdrawReadyAt` itself the client can complete first, so don't wait for the last block.
 - **Payout failures:** payouts use a native `call`. A recipient that rejects native USDC only blocks its own payout, never the other party's.
+- **Stray transfers:** USDC sent to the contract other than through `deposit()` (for example through the ERC-20 interface) credits no channel and cannot be recovered.
 
 ---
 
@@ -88,47 +97,46 @@ Events: `Deposited`, `Redeemed`, `WithdrawRequested`, `WithdrawCancelled`, `With
 
 - **Native USDC, 18 decimals.** USDC is Arc's gas token. Deposits are `msg.value`, and every amount in the contract, the vouchers and the app has 18 decimals (`parseEther` / `formatEther`). The 6-decimal ERC-20 interface at `0x3600000000000000000000000000000000000000` is not used.
 - **Fee floor.** Arc rejects transactions with `maxFeePerGas` below 20 gwei.
-- **Log range.** `eth_getLogs` accepts fewer than 10,000 blocks per call; the app's activity feed pages backwards in 9,000-block chunks from the deployment block.
+- **Log range.** `eth_getLogs` accepts fewer than 10,000 blocks per call; the activity feed pages backwards in 9,000-block chunks from the deployment block.
 - **Finality.** Sub-second blocks, so receipts arrive within a second or two and a provider can redeem right after a withdrawal request.
 
 ---
 
 ## Deployments
 
-| Network | Address | Deploy tx | Notice period |
-|---|---|---|---|
-| Arc Testnet (5042002) | [`0xeca961579bcf4978d083a0c3a72788a2def6e61a`](https://testnet.arcscan.app/address/0xeca961579bcf4978d083a0c3a72788a2def6e61a) | [`0x29280e33…`](https://testnet.arcscan.app/tx/0x29280e33cf020862a83e8f633c75fd6f4832c390ebe1c2d4250b30ec122ba444) | 120 s |
-| Arc Mainnet (5042) | coming soon | | |
+| Network | Version | Address | Deploy tx | Notice |
+|---|---|---|---|---|
+| Arc Testnet (5042002) | v2 | [`0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84`](https://explorer.testnet.arc.io/address/0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84) | [`0x926f51dc…`](https://explorer.testnet.arc.io/tx/0x926f51dc0790f172e8bd3d49727fb06fd2776ba5432734e51d5ae5f8f2c4c9ab) | 120 s |
+| Arc Mainnet (5042) | v2 | coming soon | | |
+| Arc Testnet (5042002) | v1 (superseded) | [`0xeca961579bcf4978d083a0c3a72788a2def6e61a`](https://explorer.testnet.arc.io/address/0xeca961579bcf4978d083a0c3a72788a2def6e61a) | [`0x29280e33…`](https://explorer.testnet.arc.io/tx/0x29280e33cf020862a83e8f633c75fd6f4832c390ebe1c2d4250b30ec122ba444) | 120 s |
 
-The testnet source is verified on the explorer (Blockscout): solc 0.8.28, optimizer 200 runs, EVM `paris`, constructor argument `noticePeriod = 120`.
+v2 testnet source is verified on Blockscout with a **full match** (solc 0.8.28, optimizer 200 runs, EVM `paris`, OpenZeppelin 5.1.0, constructor `noticePeriod = 120`). `forge build` with this repo's `foundry.toml` reproduces Studio's deployed v1 bytecode byte for byte, and the v2 testnet bytecode likewise.
 
-## Testnet walkthrough (real transactions)
+## Testnet walkthrough, v2 (real transactions)
 
-One full cycle with throwaway keys, client `0xfFf9…8ec8`, provider `0x20a9…d2A3`:
+Scripted end-to-end run (fresh client `0x3368…bC85`, fresh provider `0x0C90…8d58`, price 0.02 per call):
 
 | Step | Amount | Tx |
 |---|---|---|
-| Client deposits | 1.00 | [`0x2039f98f…`](https://testnet.arcscan.app/tx/0x2039f98fb2498e0b9f3ead905b8031e442a3cf666bcb7b265f3fa758e5938452) |
-| Client signs vouchers 0.05, 0.10, 0.15 off-chain | | no transactions |
-| Provider redeems only the latest (0.15) | 0.15 paid | [`0x07629b1a…`](https://testnet.arcscan.app/tx/0x07629b1a60c3323b4bb67428f7433cac9d4cfeb63702de0e360f5b0fc8bcf25a) |
-| Replaying voucher 0.05 | reverts `NothingToRedeem` | |
-| Client signs 0.20, then requests a withdrawal | | [`0xe3941259…`](https://testnet.arcscan.app/tx/0xe394125937410be7ec2d0018d468fc0d1c42bf03dc16cd1b859947b9e2cc353a) |
-| Completing before the notice ends | reverts `TooEarlyToWithdraw` | |
-| Provider redeems 0.20 during the notice | 0.05 paid (delta) | [`0x69f13464…`](https://testnet.arcscan.app/tx/0x69f13464443f098f749f214ca012eb0ef4785e8d61b877164384fa5db53be936) |
-| Client completes the withdrawal | 0.80 back | [`0x8363439e…`](https://testnet.arcscan.app/tx/0x8363439e10f08c5407a38696e585a44608376de1fefaf6db8e8e7b88095c33ba) |
+| Client deposits | 0.30 | [`0x15b68664…`](https://explorer.testnet.arc.io/tx/0x15b68664b002ad621f48ab1dfcaf392430ffc32cf5620c9c01265bde0e1c4926) |
+| 5 API calls: vouchers 0.02 … 0.10 signed off-chain, each checked by the provider | | no transactions |
+| Provider redeems only the latest voucher | 0.10 paid | [`0xd73329cf…`](https://explorer.testnet.arc.io/tx/0xd73329cf537a14c4c0a94cfefc9533165161e92547c50d87a83ee3c4757a13e8) |
+| Call #6 (voucher 0.12), then the client starts a withdrawal | | [`0x2ce47a00…`](https://explorer.testnet.arc.io/tx/0x2ce47a00e64819bd58dba77f360bb8708b37cb9a20e82837ecb4fa7062fbc4e0) |
+| Provider sees `withdrawReadyAt != 0`, stops serving, redeems the newest voucher | 0.02 paid | [`0x20955130…`](https://explorer.testnet.arc.io/tx/0x20955130e2122782fb750c8c36166b7c1eb5627c5520db482272a25cf233674f) |
+| After the 120 s notice the client completes the withdrawal | 0.18 back | [`0x2537bac3…`](https://explorer.testnet.arc.io/tx/0x2537bac324154ab0903268aa1244d9ef87ae68af9aa1d8f64b592995928d59b5) |
 
-Final channel: deposited 1.00, redeemed 0.20, withdrawn 0.80, contract balance 0.
-
-The same cycle through the live app (client and provider views, vouchers signed in the wallet):
+The same cycle through the app (client and provider views, vouchers signed in the wallet):
 
 | Step | Tx |
 |---|---|
-| Client deposits 0.60 | [`0x163c5dd0…`](https://testnet.arcscan.app/tx/0x163c5dd009d4d4ad87fde686dfa90befaab4dbf5135a1ace3345512c528a3dd5) |
-| Three calls in the demo API: vouchers 0.45, 0.50, 0.55 | off-chain |
-| Provider redeems the latest voucher: 0.15 paid | [`0x9ed22c76…`](https://testnet.arcscan.app/tx/0x9ed22c761c3e74c07570b5815b62cba67de8600e5c9c1f25d88545f04ffc6866) |
-| Client starts a withdrawal | [`0x5e03af53…`](https://testnet.arcscan.app/tx/0x5e03af53450bc766eb06db8eabb302c98845b1f93b3dfc1f5685c43c055dd236) |
-| One more call (voucher 0.56); the provider view shows "redeem before …" and redeems 0.01 | [`0x588dbc83…`](https://testnet.arcscan.app/tx/0x588dbc83d190415bd46025e8f459c11be5df051499c2c28b5ade6ff463d84251) |
-| Notice over: client completes the withdrawal, 0.84 back | [`0x7ae734d7…`](https://testnet.arcscan.app/tx/0x7ae734d71c951f420b37e4ae373835e795541e471335aa54805a46d3e1e47a2f) |
+| Client deposits 0.30 | [`0x79bc1e3a…`](https://explorer.testnet.arc.io/tx/0x79bc1e3a7540645fcb5e9bcc00b82dfcaa527e7f17bb71405cd031c1fcc35dd6) |
+| Two calls at 0.05 (a double click signs once); provider view auto-validates and redeems 0.10 | [`0x2eb45693…`](https://explorer.testnet.arc.io/tx/0x2eb4569399eacea53430646a157dc65ddc3c32ca7a8dc86822d69057eac42d81) |
+| One more call (0.15), then the client starts a withdrawal: further calls are refused, Deposit is disabled | [`0xa30a4b28…`](https://explorer.testnet.arc.io/tx/0xa30a4b2843581af4da76a7f3a7510fd5a6ca69ff30e8ed4af6f6726ec39bc53a) |
+| Provider view shows the red banner and redeems 0.05 during the notice | [`0x02ab50fe…`](https://explorer.testnet.arc.io/tx/0x02ab50fe07702de144eed86f6e195006619dbfd16822d9140e6bbddde2dd57ef) |
+| Client completes the withdrawal, 0.15 back; the provider banner clears | [`0xcceee514…`](https://explorer.testnet.arc.io/tx/0xcceee514350873e414706c9867884d2830f77867e2e10b960c9c3a82433c9833) |
+
+In the provider view a voucher signed by another key, or the high-s twin of a valid signature, is rejected before Redeem is offered.
+The v1 walkthroughs (Studio deployment) are kept in [CHANGES.md](CHANGES.md).
 
 ---
 
@@ -136,42 +144,53 @@ The same cycle through the live app (client and provider views, vouchers signed 
 
 | Path | What |
 |---|---|
-| `contracts/UsdcMeter.sol` | the contract |
-| `contracts/test/UsdcMeter.t.sol` | Foundry unit, fuzz and invariant tests (37 tests incl. a 128,000-call invariant run) |
-| `contracts/test-helpers/MaliciousProvider.sol` | reentrancy attacker used by the tests |
+| `contracts/UsdcMeter.sol` | the contract (v2) |
+| `contracts/test/UsdcMeter.t.sol` | Arc Studio's Foundry suite (unit, fuzz, reentrancy, invariants), updated for v2 |
+| `contracts/test/MeterUnit.t.sol`, `MeterInvariant.t.sol`, `Helpers.sol` | independent unit/fuzz/invariant suite |
+| `contracts/test/ReviewRegression.t.sol`, `ReviewExpected.t.sol` | regressions from the external review of v1 (they fail on v1, pass on v2) |
+| `contracts/test-helpers/` | attacker / hook contracts used by the tests |
 | `src/` | React + Vite + wagmi/viem app (client view, provider view, demo paid API, activity feed) |
-| `src/usdcmeter-config.ts` | contract address per network, EIP-712 domain and types, `VITE_ARC_NETWORK` switch |
-| `examples/python/meter_client.py` | headless client/provider for scripts, backends and agents (deposit, sign, verify, redeem, withdraw) |
+| `src/usdcmeter-config.ts` | contract address per network, `DEFAULT_NETWORK` one-line switch, EIP-712 domain and types |
+| `src/voucher-check.ts` | the provider-side checks shared by the provider view and the demo API |
+| `examples/python/meter_client.py` | headless client/provider for scripts, backends and agents |
+| `.github/workflows/pages.yml` | builds the app and publishes it to GitHub Pages on every push to `main` |
 
 ## Run it
 
 ```bash
 bun install
-bun run dev                       # app on Arc Testnet
-VITE_ARC_NETWORK=mainnet bun run build   # mainnet build once the mainnet address is filled in
-forge test                        # contract tests (needs node_modules/@openzeppelin/contracts from bun install)
+bun run dev                                  # app (Arc Testnet by default; add ?network=mainnet)
+forge test                                   # 89 contract tests (needs node_modules/@openzeppelin/contracts from bun install)
 ```
+
+Mainnet: after deploying, set one line in `src/usdcmeter-config.ts`:
+`[arcMainnet.id]: { address: '0x…', deployBlock: <block>n }` and (optionally) `DEFAULT_NETWORK = 'mainnet'`.
 
 Headless usage (Python 3.10+, `pip install eth-account eth-abi eth-utils`):
 
 ```bash
-export METER_ADDRESS=0xeca961579bcf4978d083a0c3a72788a2def6e61a CLIENT_PK=... PROVIDER_PK=...
+export METER_ADDRESS=0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84 CLIENT_PK=... PROVIDER_PK=...
 python examples/python/meter_client.py deposit 0xPROVIDER 1
-python examples/python/meter_client.py sign 0xPROVIDER 0.05 > voucher.json     # attach to each request
-python examples/python/meter_client.py verify voucher.json                     # provider, before serving
+python examples/python/meter_client.py sign 0xPROVIDER 0.05 > voucher.json      # attach to each request
+python examples/python/meter_client.py verify voucher.json 0.05                 # provider, before serving one 0.05 call
 python examples/python/meter_client.py redeem voucher.json
 ```
 
 ## How it was built
 
 The contract, its tests and the app were generated and iterated in Arc Studio: Smart Contract mode wrote the contract,
-ran two auditors and Slither, fixed what they found, wrote the Foundry suite and deployed to Arc Testnet; Build mode
-wrote the app and deployed it to Netlify. Studio's daily usage limit stopped the last fix round halfway, so four small
-follow-up fixes were made by hand (listed in [CHANGES.md](CHANGES.md)).
+ran two auditors and Slither, fixed what they found, wrote the Foundry suite and deployed v1 to Arc Testnet; Build mode
+wrote the app and deployed it to Netlify. An external review of v1 then found that a matured withdrawal request could
+sweep later deposits without notice. Studio's daily usage limit was exhausted at that point, so the v2 fix (about ten
+lines: deposits blocked while a withdrawal is pending, events before payouts, `nonReentrant` on `deposit`) and the app
+hardening were made by hand in the same workspace, tested with Studio's suite plus the new regressions, and deployed with
+the same compiler settings. Every hand change is listed in [CHANGES.md](CHANGES.md).
 
 ## Security
 
-The contract went through Arc Studio's Smart Contract pipeline (solidity-auditor and functional-auditor, two rounds; Slither; Foundry unit, fuzz, reentrancy and invariant tests). That is not a paid third-party audit. See [SECURITY.md](SECURITY.md).
+Reviewed by Arc Studio's Smart Contract pipeline (solidity-auditor and functional-auditor, Slither, Foundry) and by an
+external review of v1 whose findings are fixed or documented in v2. That is not a paid third-party audit. See
+[SECURITY.md](SECURITY.md).
 
 ## License
 
