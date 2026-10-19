@@ -32,7 +32,7 @@ export type SupportedArcChain = typeof arcTestnet | typeof arcMainnet
 export type ArcNetwork = 'testnet' | 'mainnet'
 
 /** ONE-LINE SWITCH: the network this build serves when the URL / build env do not choose one. */
-export const DEFAULT_NETWORK: ArcNetwork = 'testnet'
+export const DEFAULT_NETWORK: ArcNetwork = 'mainnet'
 
 function _pick(v: unknown): ArcNetwork | undefined {
   const s = String(v ?? '').trim().toLowerCase()
@@ -73,7 +73,7 @@ export const METER_CHAINS: Partial<Record<number, MeterChainConfig>> = {
     deployBlock: 67934662n,
   },
   // UsdcMeter v2 on Arc mainnet — fill in after mainnet/deploy.py (one line):
-  // [arcMainnet.id]: { address: '0x...', deployBlock: 0n },
+  [arcMainnet.id]: { address: '0x61afe97430a8551cd1940f314dfed86269d12cf3', deployBlock: 26700672n },
 }
 
 /** Config for the currently active chain (may be undefined on mainnet before deployment). */

@@ -1,5 +1,5 @@
 # Builds the app from this repo and publishes it to GitHub Pages (https://swiftbotlab.github.io/usdc-meter/).
-# Network: Arc Testnet by default (DEFAULT_NETWORK in src/usdcmeter-config.ts); ?network=mainnet switches at runtime.
+# Network: Arc mainnet by default (DEFAULT_NETWORK in src/usdcmeter-config.ts); ?network=testnet switches at runtime.
 # GitHub Pages can't send X-Frame-Options; src/main.tsx refuses to render inside foreign frames instead.
 name: Deploy app to GitHub Pages
 

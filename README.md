@@ -7,7 +7,7 @@ Prepaid metered billing in USDC on Arc. One deposit, a signed voucher per API ca
 Paying per API call on-chain normally means one transaction per call: fees and latency on every request. Invoices and subscriptions avoid that but bring credit risk and manual billing. USDC Meter sits in between. A client deposits USDC once into a channel for a provider. Every call carries an off-chain EIP-712 voucher that states the **cumulative** amount the client owes so far. The provider redeems the latest voucher whenever it likes and the contract pays only the difference over what was already redeemed. It is a minimal one-way payment channel, built for services or agents paying each other per call.
 
 - Live app: https://swiftbotlab.github.io/usdc-meter/ (GitHub Pages, built from this repo) and https://usdc-meter.netlify.app (Netlify).
-  Both serve Arc Testnet by default; `?network=mainnet` switches to Arc mainnet (also available as a toggle in the header).
+  Both serve Arc mainnet by default; `?network=testnet` switches to Arc Testnet (also available as a toggle in the header).
 - Contract: [`contracts/UsdcMeter.sol`](contracts/UsdcMeter.sol) (v2, about 320 lines, OpenZeppelin EIP712 + ECDSA + ReentrancyGuard)
 - Built in [Arc Studio](https://studio.arc.io): Smart Contract mode for the contract (writer, two auditors, Slither, Foundry tests, deploy), Build mode for the app
 
@@ -106,8 +106,8 @@ Events: `Deposited`, `Redeemed`, `WithdrawRequested`, `WithdrawCancelled`, `With
 
 | Network | Version | Address | Deploy tx | Notice |
 |---|---|---|---|---|
+| Arc Mainnet (5042) | v2 | [`0x61afe97430a8551cd1940f314dfed86269d12cf3`](https://explorer.arc.io/address/0x61afe97430a8551cd1940f314dfed86269d12cf3) | [`0x0332670a…`](https://explorer.arc.io/tx/0x0332670a6e772339afa3382dbc14e4b1228c7c8f5dc86f5ce467c26fc4a430bd) | 120 s |
 | Arc Testnet (5042002) | v2 | [`0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84`](https://explorer.testnet.arc.io/address/0x4c72e9de7e19b8b752f652ffcef7c99abf0a6d84) | [`0x926f51dc…`](https://explorer.testnet.arc.io/tx/0x926f51dc0790f172e8bd3d49727fb06fd2776ba5432734e51d5ae5f8f2c4c9ab) | 120 s |
-| Arc Mainnet (5042) | v2 | coming soon | | |
 | Arc Testnet (5042002) | v1 (superseded) | [`0xeca961579bcf4978d083a0c3a72788a2def6e61a`](https://explorer.testnet.arc.io/address/0xeca961579bcf4978d083a0c3a72788a2def6e61a) | [`0x29280e33…`](https://explorer.testnet.arc.io/tx/0x29280e33cf020862a83e8f633c75fd6f4832c390ebe1c2d4250b30ec122ba444) | 120 s |
 
 v2 testnet source is verified on Blockscout with a **full match** (solc 0.8.28, optimizer 200 runs, EVM `paris`, OpenZeppelin 5.1.0, constructor `noticePeriod = 120`). `forge build` with this repo's `foundry.toml` reproduces Studio's deployed v1 bytecode byte for byte, and the v2 testnet bytecode likewise.
@@ -159,12 +159,12 @@ The v1 walkthroughs (Studio deployment) are kept in [CHANGES.md](CHANGES.md).
 
 ```bash
 bun install
-bun run dev                                  # app (Arc Testnet by default; add ?network=mainnet)
+bun run dev                                  # app (Arc mainnet by default; add ?network=testnet)
 forge test                                   # 89 contract tests (needs node_modules/@openzeppelin/contracts from bun install)
 ```
 
-Mainnet: after deploying, set one line in `src/usdcmeter-config.ts`:
-`[arcMainnet.id]: { address: '0x…', deployBlock: <block>n }` and (optionally) `DEFAULT_NETWORK = 'mainnet'`.
+Networks: `METER_CHAINS` in `src/usdcmeter-config.ts` holds one line per chain (mainnet deploy block 26700672, testnet 67934662);
+`DEFAULT_NETWORK` picks the default. Both deployments are source-verified on Blockscout (exact match: solc 0.8.28, optimizer 200, EVM paris).
 
 Headless usage (Python 3.10+, `pip install eth-account eth-abi eth-utils`):
 
