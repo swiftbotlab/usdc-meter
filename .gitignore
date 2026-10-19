@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+contracts/out/
+contracts/cache/
+cache/
+out/
+*.log
+console.jsonl
+traces.jsonl
+.DS_Store
