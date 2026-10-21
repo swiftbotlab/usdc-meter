@@ -11,6 +11,8 @@ interface Props {
   refreshKey?: number
   /** Whose view this is: a matured withdrawal is good news for the client and a red flag for the provider. */
   perspective?: 'client' | 'provider'
+  /** Read channel state without a connected wallet (walletless lookup). */
+  readOnly?: boolean
 }
 
 function useCountdown(targetTs: number | undefined): string {
@@ -43,13 +45,13 @@ function fmt(raw: bigint) {
   })
 }
 
-export function ChannelCard({ client, provider, refreshKey, perspective = 'client' }: Props) {
+export function ChannelCard({ client, provider, refreshKey, perspective = 'client', readOnly = false }: Props) {
   const { chainId } = useAccount()
   const { switchChain } = useSwitchChain()
   const cfg = ACTIVE_CFG
 
   const enabled =
-    !!client && !!provider && !!cfg && chainId === ACTIVE_CHAIN.id
+    !!client && !!provider && !!cfg && (readOnly || chainId === ACTIVE_CHAIN.id)
 
   const { data, isLoading, refetch } = useReadContract({
     address: cfg?.address,
@@ -120,7 +122,7 @@ export function ChannelCard({ client, provider, refreshKey, perspective = 'clien
     )
   }
 
-  if (chainId !== ACTIVE_CHAIN.id) {
+  if (!readOnly && chainId !== ACTIVE_CHAIN.id) {
     return (
       <div className="rounded-2xl p-5" style={glass}>
         <p className="mb-3 text-sm" style={{ color: 'var(--subtle)' }}>

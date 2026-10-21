@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback } from 'react'
-import { usePublicClient, useAccount } from 'wagmi'
-import { formatEther } from 'viem'
+import { usePublicClient } from 'wagmi'
+import { formatEther, pad, decodeEventLog, type PublicClient } from 'viem'
 import { ArrowDownToLine, Receipt, Clock, XCircle, ArrowUpToLine, RefreshCw } from 'lucide-react'
 import { ACTIVE_CHAIN, ACTIVE_CFG, METER_ABI, explorerTx, explorerAddr } from '../usdcmeter-config'
+import { scanLogsSequential, readScanCache, writeScanCache } from '../logscan'
 
 type EventKind = 'Deposited' | 'Redeemed' | 'WithdrawRequested' | 'WithdrawCancelled' | 'Withdrawn'
 
@@ -33,25 +34,8 @@ const EVENT_COLORS: Record<EventKind, string> = {
   Withdrawn: 'var(--muted)',
 }
 
-const CHUNK = 9000n
 const MAX_EVENTS = 50
-
-interface Props {
-  client?: `0x${string}`
-  provider?: `0x${string}`
-  /** Bump to force an immediate refresh (e.g. after redeem). */
-  refreshKey?: number
-}
-
-// Narrow the ABI to the event entries only
-type MeterAbi = typeof METER_ABI
-type AbiEvent = Extract<MeterAbi[number], { type: 'event' }>
-
-function getEventAbi(name: EventKind): AbiEvent {
-  const found = METER_ABI.find((e): e is AbiEvent => e.type === 'event' && e.name === name)
-  if (!found) throw new Error(`Event ${name} not in ABI`)
-  return found
-}
+const CACHE_CAP = 200 // bound stored history per channel
 
 const EVENT_KINDS: EventKind[] = [
   'Deposited',
@@ -61,107 +45,140 @@ const EVENT_KINDS: EventKind[] = [
   'Withdrawn',
 ]
 
+interface Props {
+  client?: `0x${string}`
+  provider?: `0x${string}`
+  /** Bump to force an immediate refresh (e.g. after redeem). */
+  refreshKey?: number
+}
+
+function sortDesc(events: FeedEvent[]): FeedEvent[] {
+  return [...events].sort((a, b) => (a.blockNumber > b.blockNumber ? -1 : a.blockNumber < b.blockNumber ? 1 : 0))
+}
+
 export function EventFeed({ client, provider, refreshKey }: Props) {
-  const { chainId } = useAccount()
+  // publicClient for the active Arc chain — available without a connected wallet,
+  // so the feed works for a walletless channel lookup too.
   const publicClient = usePublicClient({ chainId: ACTIVE_CHAIN.id })
   const cfg = ACTIVE_CFG
 
   const [events, setEvents] = useState<FeedEvent[]>([])
   const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState('')
+  const [partial, setPartial] = useState(false)
 
   const fetchEvents = useCallback(async () => {
-    if (!publicClient || !cfg || chainId !== ACTIVE_CHAIN.id) return
+    if (!publicClient || !cfg) return
+    // Need at least one indexed party to filter on — never scan every channel.
+    if (!client && !provider) { setEvents([]); setStatus(''); setPartial(false); return }
+
     setLoading(true)
-    setEvents([])
+    setPartial(false)
+
+    const cacheKey = `meter:${ACTIVE_CHAIN.id}:${cfg.address.toLowerCase()}:${(client ?? '*').toLowerCase()}:${(provider ?? '*').toLowerCase()}`
+    const cached = readScanCache<FeedEvent>(cacheKey)
+    const haveCache = !!cached && cached.lastScanned >= cfg.deployBlock - 1n
+    const existing: FeedEvent[] = haveCache ? cached!.items : []
+    const fromBlock = haveCache ? cached!.lastScanned + 1n : cfg.deployBlock
 
     try {
-      const head = await publicClient.getBlockNumber({ cacheTime: 0 }) // fresh head: the default 4 s cache missed a just-confirmed event
-      const deployBlock = cfg.deployBlock
+      // fresh head: the default cache missed just-confirmed events
+      const head = await publicClient.getBlockNumber({ cacheTime: 0 })
 
-      const collected: FeedEvent[] = []
-      let to = head
-      let from = to >= CHUNK ? to - CHUNK + 1n : deployBlock
-      if (from < deployBlock) from = deployBlock
-
-      outer: while (to >= deployBlock && collected.length < MAX_EVENTS) {
-        setStatus(`Scanning blocks ${from.toString()}–${to.toString()}…`)
-
-        for (const kind of EVENT_KINDS) {
-          try {
-            const eventAbi = getEventAbi(kind)
-            // Build args filter — only pass indexed topics
-            const argsFilter: Record<string, (`0x${string}` | null)[] | null> = {}
-            if (client) argsFilter.client = [client]
-            if (provider) argsFilter.provider = [provider]
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const raw: unknown[] = await (publicClient.getLogs as (...a: unknown[]) => Promise<unknown[]>)({
-              address: cfg.address,
-              event: eventAbi,
-              args: argsFilter,
-              fromBlock: from,
-              toBlock: to,
-            })
-
-            for (const logRaw of raw) {
-              const log = logRaw as Record<string, unknown>
-              const args = (log.args ?? {}) as Record<string, unknown>
-              let amount: bigint | undefined
-              let extra: string | undefined
-
-              if (kind === 'Deposited' && args.amount) {
-                amount = args.amount as bigint
-              } else if (kind === 'Redeemed' && args.paid) {
-                amount = args.paid as bigint
-                extra = `cumulative: ${parseFloat(formatEther(args.cumulativeAmount as bigint)).toLocaleString('en-US', { maximumFractionDigits: 6 })} USDC`
-              } else if (kind === 'Withdrawn' && args.amount) {
-                amount = args.amount as bigint
-              } else if (kind === 'WithdrawRequested' && args.readyAt) {
-                extra = `Ready at ${new Date(Number(args.readyAt) * 1000).toLocaleString()}`
-              }
-
-              collected.push({
-                id: `${(log.transactionHash as string | undefined) ?? ''}-${String(Number(log.logIndex ?? 0))}`,
-                kind,
-                blockNumber: (log.blockNumber as bigint | undefined) ?? 0n,
-                txHash: (log.transactionHash as string | undefined) ?? '',
-                client: (args.client as string | undefined) ?? '',
-                provider: (args.provider as string | undefined) ?? '',
-                amount,
-                extra,
-              })
-            }
-          } catch {
-            // Event may not be present in range — continue
-          }
-        }
-
-        if (collected.length >= MAX_EVENTS) break outer
-
-        if (from <= deployBlock) break
-        to = from - 1n
-        from = to >= CHUNK ? to - CHUNK + 1n : deployBlock
-        if (from < deployBlock) from = deployBlock
+      if (fromBlock > head) {
+        const sorted = sortDesc(existing)
+        setEvents(sorted.slice(0, MAX_EVENTS))
+        setStatus(`Showing ${Math.min(sorted.length, MAX_EVENTS)} event${sorted.length !== 1 ? 's' : ''}`)
+        setLoading(false)
+        return
       }
 
-      collected.sort((a, b) => (a.blockNumber > b.blockNumber ? -1 : 1))
-      setEvents(collected.slice(0, MAX_EVENTS))
-      setStatus(`Showing ${Math.min(collected.length, MAX_EVENTS)} event${collected.length !== 1 ? 's' : ''}`)
+      // topic1 = client, topic2 = provider (both indexed on every Meter event).
+      // ONE getLogs per 9k chunk for ALL event kinds of this channel.
+      const topics: (`0x${string}` | null)[] = [
+        null,
+        client ? pad(client, { size: 32 }) : null,
+        provider ? pad(provider, { size: 32 }) : null,
+      ]
+
+      const { logs, complete, lastScanned } = await scanLogsSequential(
+        publicClient as unknown as PublicClient,
+        fromBlock,
+        head,
+        { address: cfg.address, topics },
+        (f, t) => setStatus(`Scanning blocks ${f.toString()}–${t.toString()}…`),
+      )
+
+      const fresh: FeedEvent[] = []
+      for (const log of logs) {
+        let dec: { eventName: string; args: Record<string, unknown> } | null = null
+        try {
+          dec = decodeEventLog({
+            abi: METER_ABI,
+            data: log.data as `0x${string}`,
+            topics: log.topics as unknown as [`0x${string}`, ...`0x${string}`[]],
+          }) as unknown as { eventName: string; args: Record<string, unknown> }
+        } catch { continue }
+        const kind = dec?.eventName as EventKind
+        if (!dec || !EVENT_KINDS.includes(kind)) continue
+        const args = dec.args ?? {}
+
+        let amount: bigint | undefined
+        let extra: string | undefined
+        if (kind === 'Deposited' && args.amount) {
+          amount = args.amount as bigint
+        } else if (kind === 'Redeemed' && args.paid) {
+          amount = args.paid as bigint
+          extra = `cumulative: ${parseFloat(formatEther(args.cumulativeAmount as bigint)).toLocaleString('en-US', { maximumFractionDigits: 6 })} USDC`
+        } else if (kind === 'Withdrawn' && args.amount) {
+          amount = args.amount as bigint
+        } else if (kind === 'WithdrawRequested' && args.readyAt) {
+          extra = `Ready at ${new Date(Number(args.readyAt) * 1000).toLocaleString()}`
+        }
+
+        fresh.push({
+          id: `${(log.transactionHash as string | null) ?? ''}-${String(log.logIndex ?? 0)}`,
+          kind,
+          blockNumber: (log.blockNumber as bigint | null) ?? 0n,
+          txHash: (log.transactionHash as string | null) ?? '',
+          client: (args.client as string | undefined) ?? '',
+          provider: (args.provider as string | undefined) ?? '',
+          amount,
+          extra,
+        })
+      }
+
+      // Merge with cache, dedupe by log id, newest first.
+      const byId = new Map<string, FeedEvent>()
+      for (const e of existing) byId.set(e.id, e)
+      for (const e of fresh) byId.set(e.id, e)
+      const merged = sortDesc([...byId.values()])
+
+      setEvents(merged.slice(0, MAX_EVENTS))
+      setPartial(!complete)
+      writeScanCache(cacheKey, complete ? head : lastScanned, merged.slice(0, CACHE_CAP))
+      setStatus(
+        complete
+          ? `Showing ${Math.min(merged.length, MAX_EVENTS)} event${merged.length !== 1 ? 's' : ''}`
+          : 'Some activity is still loading',
+      )
     } catch (e) {
-      setStatus('Failed to load events')
+      setStatus('Could not load activity')
+      setPartial(true)
+      // keep any cached events visible
+      if (existing.length) setEvents(sortDesc(existing).slice(0, MAX_EVENTS))
       console.error(e)
     } finally {
       setLoading(false)
     }
-  }, [publicClient, cfg, chainId, client, provider])
+  }, [publicClient, cfg, client, provider])
 
   /* oxlint-disable react/set-state-in-effect */
   useEffect(() => {
     void fetchEvents()
   }, [fetchEvents])
 
-  // Fix 4: re-fetch when parent bumps refreshKey (e.g. after a successful redeem)
+  // Re-fetch when parent bumps refreshKey (e.g. after a successful redeem)
   useEffect(() => {
     if (refreshKey !== undefined && refreshKey > 0) {
       void fetchEvents()
@@ -194,6 +211,16 @@ export function EventFeed({ client, provider, refreshKey }: Props) {
 
       {status && (
         <p className="mb-2 text-[10px]" style={{ color: 'var(--subtle)' }}>{status}</p>
+      )}
+
+      {partial && !loading && (
+        <button
+          onClick={() => void fetchEvents()}
+          className="mb-2 text-[10px] underline"
+          style={{ color: '#c9a020' }}
+        >
+          Some activity is still loading — Retry
+        </button>
       )}
 
       {loading && events.length === 0 && (
