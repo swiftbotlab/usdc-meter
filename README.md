@@ -9,7 +9,9 @@ Paying per API call on-chain normally means one transaction per call: fees and l
 - Live app: https://swiftbotlab.github.io/usdc-meter/ (GitHub Pages, built from this repo) and https://usdc-meter.netlify.app (Netlify).
   Both serve Arc mainnet by default; `?network=testnet` switches to Arc Testnet (also available as a toggle in the header).
 - Contract: [`contracts/UsdcMeter.sol`](contracts/UsdcMeter.sol) (v2, about 320 lines, OpenZeppelin EIP712 + ECDSA + ReentrancyGuard)
-- Built in [Arc Studio](https://studio.arc.io): Smart Contract mode for the contract (writer, two auditors, Slither, Foundry tests, deploy), Build mode for the app
+- Built in [Arc Studio](https://studio.arc.io/app/842c6457-afa2-49d9-814b-84d3f67535b8): Smart Contract mode for the contract (writer, two auditors, Slither, Foundry tests, deploy), Build mode for the app
+- Video walkthrough: https://github.com/swiftbotlab/usdc-meter/releases/download/v1.0.0/usdc-meter-arc-studio-mainnet.mp4
+- Look up any channel without a wallet: https://usdc-meter.netlify.app/?provider=0xa11918351636D83eD777B6c62076909C671aD524&client=0x03d07a1e6ADC5c079d916D5EC6AfB0B4ED5e7951
 
 ---
 
